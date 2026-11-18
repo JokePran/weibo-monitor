@@ -1,0 +1,49 @@
+name: 微博监控推送
+
+# 每 5 分钟触发一次（GitHub Actions 最小粒度）。
+# cron 使用 UTC；北京时间 = UTC+8。
+# 交易时段 9:30-15:00 北京时间 = 01:30-07:00 UTC，周一至周五。
+# 为避免整点高并发延迟，覆盖 01:25-07:05，脚本内再做精确时段与交易日判断。
+on:
+  schedule:
+    - cron: '25,30,35,40,45,50,55 1 * * 1-5'   # 北京 09:25-09:55
+    - cron: '0,5,10,15,20,25,30,35,40,45,50,55 2,3,4,5,6 * * 1-5'  # 北京 10:00-14:55
+    - cron: '0,5 7 * * 1-5'                      # 北京 15:00-15:05
+  workflow_dispatch:                             # 允许手动触发测试
+
+permissions:
+  contents: write   # 用于把 state.json 的去重状态提交回仓库
+
+concurrency:
+  group: weibo-monitor
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 检出仓库
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 运行监控脚本
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+        run: python3 monitor.py
+
+      - name: 提交去重状态
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet -- state.json; then
+            echo "状态无变化，跳过提交"
+          else
+            git add state.json
+            git commit -m "chore: update weibo monitor state [skip ci]"
+            git push
+          fi
