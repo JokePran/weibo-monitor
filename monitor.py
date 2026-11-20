@@ -28,7 +28,14 @@ from datetime import datetime, timedelta, timezone
 # ----------------------------- 配置区 -----------------------------
 UID = "3962719063"
 AUTHOR = "挖地瓜的超级鹿鼎公"
+# 重要：裸地址会被 CDN 长期缓存（实测滞后 1 小时以上），
+# 必须带查询参数才能拿到实时内容。同时抓多个入口再合并，双保险。
 MIRROR_URL = f"http://www.sina.cn/media/{UID}"
+MIRROR_URLS = [
+    f"https://www.sina.cn/media/{UID}?page=1",   # 实测实时
+    f"https://www.sina.cn/media/{UID}?vt=4",     # 实测实时
+    f"http://www.sina.cn/media/{UID}",           # 裸地址（可能滞后，作兜底）
+]
 DETAIL_BASE = "https://www.sina.cn/news/detail"
 
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.json")
@@ -105,6 +112,33 @@ def fetch_html(url: str, retries: int = 3) -> str:
             log(f"抓取失败({i + 1}/{retries}): {e}")
             time.sleep(2 * (i + 1))
     raise RuntimeError(f"抓取最终失败: {last_err}")
+
+
+def fetch_all_posts():
+    """抓取多个镜像入口，解析后按 mid 合并去重，返回按时间正序的列表。
+
+    任一入口成功即可工作；某个入口滞后时，其他入口的新内容仍能补上。
+    """
+    merged = {}
+    ok_count = 0
+    for url in MIRROR_URLS:
+        try:
+            page = fetch_html(url, retries=2)
+        except Exception as e:  # noqa: BLE001
+            log(f"入口失败 {url}: {e}")
+            continue
+        posts = parse_posts(page)
+        if not posts:
+            log(f"入口无数据 {url}")
+            continue
+        ok_count += 1
+        newest = posts[-1]
+        log(f"入口 {url} → {len(posts)} 条，最新 {newest['time']} (mid={newest['mid']})")
+        for p in posts:
+            merged[p["mid"]] = p
+    if ok_count == 0:
+        return []
+    return sorted(merged.values(), key=lambda p: mid_num(p["mid"]))
 
 
 def clean(text: str) -> str:
@@ -239,10 +273,9 @@ def main():
             return
 
     log(f"开始检查 {AUTHOR} 的微博 ...")
-    page = fetch_html(MIRROR_URL)
-    posts = parse_posts(page)
+    posts = fetch_all_posts()
     if not posts:
-        log("未解析到微博，页面结构可能变化，跳过")
+        log("所有入口均未解析到微博，页面结构可能变化，跳过")
         return
     log(f"解析到 {len(posts)} 条微博，最新: {posts[-1]['time']} (mid={posts[-1]['mid']})")
 
