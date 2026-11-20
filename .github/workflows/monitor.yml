@@ -1,18 +1,22 @@
 name: 微博监控推送
 
-# 每 5 分钟触发一次（GitHub Actions 最小粒度）。
-# cron 使用 UTC；北京时间 = UTC+8。
-# 交易时段 9:30-15:00 北京时间 = 01:30-07:00 UTC，周一至周五。
-# 为避免整点高并发延迟，覆盖 01:25-07:05，脚本内再做精确时段与交易日判断。
+# 设计说明：
+# GitHub Actions 的 schedule 触发极不可靠（会延迟数小时甚至丢弃），
+# 因此这里不依赖"每 5 分钟触发一次"，而是：
+#   一次触发 → 启动一个长驻任务 → 内部每约 4 分钟检查一次微博 → 跑到收盘自动退出。
+# 即使触发延迟 1-2 小时，只要在盘中启动，就能覆盖剩余时段；
+# 脚本按 last_mid 补推，之前漏掉的微博会在启动后一次性补齐，不会丢。
+# 另设两个兜底触发点，防止主触发被完全丢弃。
+
 on:
   schedule:
-    - cron: '25,30,35,40,45,50,55 1 * * 1-5'   # 北京 09:25-09:55
-    - cron: '0,5,10,15,20,25,30,35,40,45,50,55 2,3,4,5,6 * * 1-5'  # 北京 10:00-14:55
-    - cron: '0,5 7 * * 1-5'                      # 北京 15:00-15:05
-  workflow_dispatch:                             # 允许手动触发测试
+    - cron: '15 1 * * 1-5'   # 北京 09:15 主触发（UTC 01:15）
+    - cron: '30 2 * * 1-5'   # 北京 10:30 兜底（UTC 02:30）
+    - cron: '50 4 * * 1-5'   # 北京 12:50 兜底下午（UTC 04:50）
+  workflow_dispatch:          # 手动触发
 
 permissions:
-  contents: write   # 用于把 state.json 的去重状态提交回仓库
+  contents: write   # 提交 state.json 去重状态
 
 concurrency:
   group: weibo-monitor
@@ -21,7 +25,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 350   # 9:15-15:05 约 5h50m，GitHub 单 job 上限 6 小时
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -31,19 +35,56 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: 运行监控脚本
+      - name: 交易时段持续监控
         env:
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-        run: python3 monitor.py
-
-      - name: 提交去重状态
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet -- state.json; then
-            echo "状态无变化，跳过提交"
-          else
-            git add state.json
-            git commit -m "chore: update weibo monitor state [skip ci]"
-            git push
+          export TZ=Asia/Shanghai
+          echo "启动时间（北京时间）: $(date '+%Y-%m-%d %H:%M:%S %A')"
+
+          # 周末直接退出
+          DOW=$(date +%u)
+          if [ "$DOW" -ge 6 ]; then
+            echo "周末休市，退出"
+            exit 0
           fi
+
+          # 法定休市日直接退出（与 monitor.py 内 HOLIDAYS_2026 保持一致）
+          TODAY=$(date +%Y-%m-%d)
+          case "$TODAY" in
+            2026-01-01|2026-01-02|2026-02-16|2026-02-17|2026-02-18|2026-02-19|2026-02-20|2026-02-23|2026-04-06|2026-05-01|2026-05-04|2026-05-05|2026-06-19|2026-09-25|2026-10-01|2026-10-02|2026-10-05|2026-10-06|2026-10-07)
+              echo "法定休市日 $TODAY，退出"
+              exit 0
+              ;;
+          esac
+
+          while true; do
+            CUR=$((10#$(date +%H) * 60 + 10#$(date +%M)))
+            # 15:05 = 905 分，收盘后退出
+            if [ "$CUR" -gt 905 ]; then
+              echo "已收盘（$(date +%H:%M)），退出循环"
+              break
+            fi
+            # 09:25 = 565 分，未到开盘则等待
+            if [ "$CUR" -lt 565 ]; then
+              echo "未开盘（$(date +%H:%M)），等待中..."
+              sleep 60
+              continue
+            fi
+
+            echo "=== $(date '+%H:%M:%S') 执行检查 ==="
+            python3 monitor.py || echo "本次检查异常，继续下一轮"
+
+            # 提交去重状态（仅当有变化）
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            if ! git diff --quiet -- state.json; then
+              git add state.json
+              git commit -m "chore: update state [skip ci]" || true
+              git pull --rebase -q origin main || true
+              git push -q || echo "推送状态失败，继续监控"
+            fi
+
+            sleep 240   # 约 4 分钟一轮
+          done
+          echo "监控结束: $(date '+%Y-%m-%d %H:%M:%S')"
