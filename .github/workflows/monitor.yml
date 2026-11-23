@@ -1,19 +1,23 @@
 name: 微博监控推送
 
 # 设计说明：
-# GitHub Actions 的 schedule 触发极不可靠（会延迟数小时甚至丢弃），
-# 因此这里不依赖"每 5 分钟触发一次"，而是：
-#   一次触发 → 启动一个长驻任务 → 内部每约 4 分钟检查一次微博 → 跑到收盘自动退出。
-# 即使触发延迟 1-2 小时，只要在盘中启动，就能覆盖剩余时段；
-# 脚本按 last_mid 补推，之前漏掉的微博会在启动后一次性补齐，不会丢。
-# 另设两个兜底触发点，防止主触发被完全丢弃。
+# GitHub Actions 自带的 schedule 触发极不可靠（实测：会延迟数小时、甚至整天不执行）。
+# 2026-11-20 三次 cron 全部被丢弃；2026-11-23 又整天没触发。
+# 因此现在的主触发源是外部定时器 cron-job.org（每 5 分钟 POST 一次 workflow_dispatch），
+# 下面的 schedule 仅作为兜底保留。
+#
+#   外部触发 → 启动长驻任务 → 内部每约 4 分钟检查一次微博 → 跑到收盘自动退出。
+#
+# 关键：非监控窗口（09:10 之前 / 15:10 之后）必须立即退出，
+# 否则外部定时器半夜触发时会空等，占用 6 小时额度，还会把白天的触发挤进并发队列。
+# 脚本按 last_mid 补推，延迟期间漏掉的微博会在启动后一次性补齐。
 
 on:
   schedule:
-    - cron: '15 1 * * 1-5'   # 北京 09:15 主触发（UTC 01:15）
-    - cron: '30 2 * * 1-5'   # 北京 10:30 兜底（UTC 02:30）
-    - cron: '50 4 * * 1-5'   # 北京 12:50 兜底下午（UTC 04:50）
-  workflow_dispatch:          # 手动触发
+    - cron: '15 1 * * 1-5'   # 北京 09:15（兜底，不可靠）
+    - cron: '30 2 * * 1-5'   # 北京 10:30（兜底）
+    - cron: '50 4 * * 1-5'   # 北京 12:50（兜底）
+  workflow_dispatch:          # 外部定时器 cron-job.org 调这里；也可手动触发
 
 permissions:
   contents: write   # 提交 state.json 去重状态
@@ -25,7 +29,7 @@ concurrency:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # 9:15-15:05 约 5h50m，GitHub 单 job 上限 6 小时
+    timeout-minutes: 355   # 09:10-15:05 约 5h55m，GitHub 单 job 上限 6 小时
     steps:
       - name: 检出仓库
         uses: actions/checkout@v4
@@ -58,6 +62,14 @@ jobs:
               ;;
           esac
 
+          # 外部定时器（cron-job.org）会频繁触发，非监控窗口必须立即退出，
+          # 否则会空等、占用 6 小时额度，还会把当天的触发挤进并发队列。
+          NOW_MIN=$((10#$(date +%H) * 60 + 10#$(date +%M)))
+          if [ "$NOW_MIN" -lt 550 ] || [ "$NOW_MIN" -gt 910 ]; then
+            echo "非监控窗口（$(date +%H:%M)），立即退出"
+            exit 0
+          fi
+
           while true; do
             CUR=$((10#$(date +%H) * 60 + 10#$(date +%M)))
             # 15:05 = 905 分，收盘后退出
@@ -68,7 +80,7 @@ jobs:
             # 09:25 = 565 分，未到开盘则等待
             if [ "$CUR" -lt 565 ]; then
               echo "未开盘（$(date +%H:%M)），等待中..."
-              sleep 60
+              sleep 30
               continue
             fi
 
