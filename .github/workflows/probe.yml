@@ -11,39 +11,68 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - name: 探测各入口新鲜度
+      - name: 探测抓取与推送链路
+        env:
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: |
           export TZ=Asia/Shanghai
           echo "探测时间（北京）: $(date '+%Y-%m-%d %H:%M:%S')"
           python3 - <<'PYEOF'
-          import re, time, urllib.request, html
+          import re, json, os, time, urllib.request
 
           UID = "3962719063"
           UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/195E148 Safari/604.1")
           URLS = [
               f"https://www.sina.cn/media/{UID}?page=1",
               f"https://www.sina.cn/media/{UID}?vt=4",
               f"http://www.sina.cn/media/{UID}",
-              f"https://www.sina.cn/media/{UID}?page=1&vt=4",
-              f"https://www.sina.cn/media/{UID}?from=page",
-              f"https://www.sina.cn/media/{UID}?page=2",
           ]
 
+          merged = {}
           for url in URLS:
               try:
-                  req = urllib.request.Request(url, headers={"User-Agent": UA,
-                                                            "Accept": "text/html,application/xhtml+xml"})
-                  t0 = time.time()
+                  req = urllib.request.Request(url, headers={"User-Agent": UA})
                   with urllib.request.urlopen(req, timeout=25) as r:
                       page = r.read().decode("utf-8", errors="ignore")
-                      cache = r.headers.get("x-cache", "-")
-                  cost = time.time() - t0
-                  times = re.findall(r'class="time">\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', page)
-                  mids = re.findall(r'class="post-link" href="/news/detail/(\d+)\.html"', page)
-                  newest = max(zip(times, mids), default=("NA", "NA"))
-                  print(f"RESULT {url} | {len(page)}B {cost:.1f}s x-cache={cache} | 条数={len(times)} 最新={newest[0]} mid={newest[1]}")
+                  block = re.findall(
+                      r'<a class="post-link" href="/news/detail/(\d+)\.html".*?class="time">\s*'
+                      r'(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', page, re.S)
+                  for mid, t in block:
+                      merged[mid] = t
+                  newest = max(block, key=lambda x: int(x[0])) if block else ("NA", "NA")
+                  print(f"RESULT 入口 {url} | 条数={len(block)} 最新={newest[1]} mid={newest[0]}")
               except Exception as e:
-                  print(f"RESULT {url} | 失败 {e}")
+                  print(f"RESULT 入口 {url} | 失败 {e}")
+
+          # 与 monitor.py 相同的判断：当天 09:30-15:00 内的才推
+          from datetime import datetime, timezone, timedelta
+          CST = timezone(timedelta(hours=8))
+          now = datetime.now(CST)
+          base = 5368706906719242   # 当前远端 last_mid
+          cands = sorted([(int(m), t) for m, t in merged.items() if int(m) > base])
+          print(f"INFO 合并后 {len(merged)} 条，基准之后 {len(cands)} 条")
+          for mid, t in cands:
+              dt = datetime.strptime(t, "%Y-%m-%d %H:%M").replace(tzinfo=CST)
+              ok = (dt.strftime("%Y-%m-%d") == now.strftime("%Y-%m-%d")
+                    and (9, 30) <= (dt.hour, dt.minute) <= (15, 0))
+              print(f"  候选 {t} mid={mid} 在交易时段={ok}")
+
+          # 直接测 pushplus 返回
+          token = os.environ.get("PUSHPLUS_TOKEN", "")
+          print(f"INFO PUSHPLUS_TOKEN 长度={len(token)}")
+          body = json.dumps({
+              "token": token,
+              "title": "云端链路自检",
+              "content": f"<p>GitHub 云端调用 pushplus 自检，时间 {now.strftime('%H:%M:%S')}</p>",
+              "template": "html",
+          }).encode()
+          req = urllib.request.Request("https://www.pushplus.plus/send", data=body,
+                                       headers={"Content-Type": "application/json"}, method="POST")
+          try:
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  print("PUSHPLUS 返回:", r.read().decode())
+          except Exception as e:
+              print("PUSHPLUS 异常:", e)
           PYEOF
           echo "探测结束"
