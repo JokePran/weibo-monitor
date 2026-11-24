@@ -249,11 +249,17 @@ def build_message(p: dict) -> tuple:
     return title, "".join(parts)
 
 
-def push_to_wechat(title: str, content: str) -> bool:
-    """通过 pushplus 推送（HTML 模板）。"""
+def push_to_wechat(title: str, content: str) -> int:
+    """通过 pushplus 推送（HTML 模板）。
+
+    返回 pushplus 的 code：
+        200 = 成功
+        900 = 当日请求次数已用尽（配额耗尽，当天不该再试）
+        -1  = 网络异常 / 其它未知失败
+    """
     if not PUSHPLUS_TOKEN:
         log("未设置 PUSHPLUS_TOKEN 环境变量，跳过推送")
-        return False
+        return -1
     data = json.dumps({
         "token": PUSHPLUS_TOKEN,
         "title": title,
@@ -269,14 +275,15 @@ def push_to_wechat(title: str, content: str) -> bool:
     try:
         with urllib.request.urlopen(req, timeout=20) as resp:
             result = json.loads(resp.read().decode("utf-8"))
-        if result.get("code") == 200:
-            log(f"推送成功: {title}")
-            return True
-        log(f"推送返回异常: {result}")
-        return False
     except Exception as e:  # noqa: BLE001
-        log(f"推送失败: {e}")
-        return False
+        log(f"推送失败（网络）: {e}")
+        return -1
+    code = result.get("code")
+    if code == 200:
+        log(f"推送成功: {title}")
+        return 200
+    log(f"推送返回异常: {result}")
+    return code if isinstance(code, int) else -1
 
 
 def main():
@@ -307,6 +314,12 @@ def main():
     last_mid = state.get("last_mid")
     latest_mid = posts[-1]["mid"]
 
+    # 当日配额已耗尽时不再徒劳尝试（pushplus 免费额度按自然日重置）
+    today = now.strftime("%Y-%m-%d")
+    if state.get("quota_blocked") == today and not force:
+        log(f"今日 pushplus 请求配额已用尽（{today}），本日不再尝试推送，次日自动恢复")
+        return
+
     # 首次运行 / 强制初始化：只记录基准，不推送历史微博
     if do_init or not last_mid:
         save_state({"last_mid": latest_mid,
@@ -330,19 +343,29 @@ def main():
     pushed = 0        # 本轮实际推送条数
     skipped = 0       # 因不在交易时段而跳过条数
     stopped = False   # 遇到推送失败提前中止
+    quota_hit = False  # 当日配额耗尽
 
     for p in candidates:
         in_window = post_in_session(p, now)
 
         if in_window and not dry_run:
             title, content = build_message(p)
-            if not push_to_wechat(title, content):
-                # 推送失败：立刻停止本轮，不推进 last_mid，
+            code = push_to_wechat(title, content)
+            if code == 900:
+                # 当日请求次数已用尽：继续尝试只会白费，标记后本日停止推送
+                quota_hit = True
+                stopped = True
+                state["quota_blocked"] = today
+                save_state(state)
+                log("pushplus 当日配额已用尽（code 900），本日停止推送；该条未送达")
+                break
+            if code != 200:
+                # 其它失败：立刻停止本轮，不推进 last_mid，
                 # 下一轮从这条继续，已经推成功的不会重推。
                 stopped = True
                 log(f"推送失败，本轮中止（{p['time']}），下一轮从此条重试")
                 break
-            time.sleep(1)  # pushplus 限 5 次/分钟，逐条之间留间隔
+            time.sleep(2)  # pushplus 限 5 次/分钟，逐条之间留间隔
 
         if in_window:
             if dry_run:
@@ -370,6 +393,8 @@ def main():
     state["last_check"] = now.isoformat()
     save_state(state)
     log(f"本轮结束：推送 {pushed} 条，跳过 {skipped} 条，累计推送 {state.get('total_pushed', 0)} 条")
+    if quota_hit:
+        log("提示：pushplus 免费额度按自然日重置，明天会自动恢复推送")
 
 
 if __name__ == "__main__":
