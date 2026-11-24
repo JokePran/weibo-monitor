@@ -201,6 +201,30 @@ def mid_num(mid: str) -> int:
         return 0
 
 
+def parse_post_time(p: dict):
+    """把微博的 'YYYY-MM-DD HH:MM' 解析为北京时间 datetime，失败返回 None。"""
+    t = (p.get("time") or "").strip()
+    try:
+        return datetime.strptime(t, "%Y-%m-%d %H:%M").replace(tzinfo=CST)
+    except ValueError:
+        return None
+
+
+def post_in_session(p: dict, now: datetime) -> bool:
+    """该微博是否属于「当天交易时段内发布」——只推这类。
+
+    规则：日期必须与当前交易日相同，且时间在 09:30-15:00 之间。
+    这样隔夜、开盘前、收盘后发布的微博即使比基准新，也不会被补推。
+    时间解析不出来时按「不推」处理（宁可少推，也不要把隔夜内容灌给用户）。
+    """
+    dt = parse_post_time(p)
+    if dt is None:
+        return False
+    if dt.strftime("%Y-%m-%d") != now.strftime("%Y-%m-%d"):
+        return False
+    return SESSION_START <= (dt.hour, dt.minute) <= SESSION_END
+
+
 def build_message(p: dict) -> tuple:
     """构造一条推送的标题与 HTML 正文。"""
     title = f"{AUTHOR} · {p['time'][-5:] if p['time'] else '新微博'}"
@@ -291,41 +315,61 @@ def main():
         log(f"已初始化已读基准 mid={latest_mid}，本次不推送历史微博")
         return
 
-    # 找出比 last_mid 更新的微博
+    # 找出比 last_mid 更新的微博（基准之后的所有候选）
     base = mid_num(last_mid)
-    new_posts = [p for p in posts if mid_num(p["mid"]) > base]
+    candidates = [p for p in posts if mid_num(p["mid"]) > base]
 
-    if not new_posts:
+    if not candidates:
         state["last_check"] = now.isoformat()
         save_state(state)
         log("没有新微博")
         return
 
-    log(f"发现 {len(new_posts)} 条新微博")
-    pushed_ok = 0
-    for p in new_posts:
-        if dry_run:
-            log(f"[DRY-RUN] {p['time']} | {p['text'][:80]}")
-            continue
-        title, content = build_message(p)
-        if push_to_wechat(title, content):
-            pushed_ok += 1
-            time.sleep(0.5)  # 轻微间隔，避免触发频率限制
+    log(f"基准之后共 {len(candidates)} 条，逐条判断是否在交易时段内（09:30-15:00 当天）")
 
-    # 仅当全部（或非 dry-run 下有成功）推送后，才推进 last_mid，避免漏推
+    pushed = 0        # 本轮实际推送条数
+    skipped = 0       # 因不在交易时段而跳过条数
+    stopped = False   # 遇到推送失败提前中止
+
+    for p in candidates:
+        in_window = post_in_session(p, now)
+
+        if in_window and not dry_run:
+            title, content = build_message(p)
+            if not push_to_wechat(title, content):
+                # 推送失败：立刻停止本轮，不推进 last_mid，
+                # 下一轮从这条继续，已经推成功的不会重推。
+                stopped = True
+                log(f"推送失败，本轮中止（{p['time']}），下一轮从此条重试")
+                break
+            time.sleep(1)  # pushplus 限 5 次/分钟，逐条之间留间隔
+
+        if in_window:
+            if dry_run:
+                log(f"[DRY-RUN] 将推送: {p['time']} | {p['text'][:60]}")
+            pushed += 1
+            if not dry_run:
+                state["total_pushed"] = state.get("total_pushed", 0) + 1
+        else:
+            skipped += 1
+            log(f"跳过（非交易时段）: {p['time']} mid={p['mid']}")
+
+        # 每条处理完立即推进并落盘：既跨过不推的微博，也防止重复推送
+        if not dry_run:
+            state["last_mid"] = p["mid"]
+            state["last_check"] = now.isoformat()
+            save_state(state)
+
     if dry_run:
-        log("[DRY-RUN] 不更新状态")
+        log(f"[DRY-RUN] 将推送 {pushed} 条，跳过 {skipped} 条；不更新状态")
         return
-    if pushed_ok == len(new_posts):
-        state["last_mid"] = new_posts[-1]["mid"]
-        state["last_check"] = now.isoformat()
-        state["total_pushed"] = state.get("total_pushed", 0) + pushed_ok
-        save_state(state)
-        log(f"状态已更新，last_mid={state['last_mid']}，累计推送 {state['total_pushed']} 条")
-    else:
-        state["last_check"] = now.isoformat()
-        save_state(state)
-        log(f"部分推送失败（{pushed_ok}/{len(new_posts)}），本次不推进 last_mid，下轮重试")
+
+    if skipped and pushed == 0 and not stopped:
+        log(f"本轮无交易时段内新微博（跳过 {skipped} 条隔夜/非时段内容）")
+
+    state["last_check"] = now.isoformat()
+    save_state(state)
+    log(f"本轮结束：推送 {pushed} 条，跳过 {skipped} 条，累计推送 {state.get('total_pushed', 0)} 条")
 
 
 if __name__ == "__main__":
