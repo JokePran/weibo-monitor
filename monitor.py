@@ -314,11 +314,19 @@ def main():
     last_mid = state.get("last_mid")
     latest_mid = posts[-1]["mid"]
 
-    # 当日配额已耗尽时不再徒劳尝试（pushplus 免费额度按自然日重置）
+    # 当日配额已耗尽时不再徒劳尝试；但每小时允许复查一次，
+    # 万一配额提前恢复（或只是临时限制）能自动继续推送。
     today = now.strftime("%Y-%m-%d")
     if state.get("quota_blocked") == today and not force:
-        log(f"今日 pushplus 请求配额已用尽（{today}），本日不再尝试推送，次日自动恢复")
-        return
+        blocked_at = state.get("quota_blocked_at")
+        try:
+            last_try = datetime.fromisoformat(blocked_at) if blocked_at else None
+        except ValueError:
+            last_try = None
+        if last_try and (now - last_try) < timedelta(hours=1):
+            log(f"今日 pushplus 请求配额已用尽（{today}），本小时不再尝试推送，稍后复查")
+            return
+        log("配额熔断满 1 小时，复查一次是否已恢复")
 
     # 首次运行 / 强制初始化：只记录基准，不推送历史微博
     if do_init or not last_mid:
@@ -356,6 +364,7 @@ def main():
                 quota_hit = True
                 stopped = True
                 state["quota_blocked"] = today
+                state["quota_blocked_at"] = now.isoformat()
                 save_state(state)
                 log("pushplus 当日配额已用尽（code 900），本日停止推送；该条未送达")
                 break
