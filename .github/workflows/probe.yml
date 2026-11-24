@@ -1,0 +1,49 @@
+name: 抓取新鲜度探测（临时）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: 探测各入口新鲜度
+        run: |
+          export TZ=Asia/Shanghai
+          echo "探测时间（北京）: $(date '+%Y-%m-%d %H:%M:%S')"
+          python3 - <<'PYEOF'
+          import re, time, urllib.request, html
+
+          UID = "3962719063"
+          UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1")
+          URLS = [
+              f"https://www.sina.cn/media/{UID}?page=1",
+              f"https://www.sina.cn/media/{UID}?vt=4",
+              f"http://www.sina.cn/media/{UID}",
+              f"https://www.sina.cn/media/{UID}?page=1&vt=4",
+              f"https://www.sina.cn/media/{UID}?from=page",
+              f"https://www.sina.cn/media/{UID}?page=2",
+          ]
+
+          for url in URLS:
+              try:
+                  req = urllib.request.Request(url, headers={"User-Agent": UA,
+                                                            "Accept": "text/html,application/xhtml+xml"})
+                  t0 = time.time()
+                  with urllib.request.urlopen(req, timeout=25) as r:
+                      page = r.read().decode("utf-8", errors="ignore")
+                      cache = r.headers.get("x-cache", "-")
+                  cost = time.time() - t0
+                  times = re.findall(r'class="time">\s*(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})', page)
+                  mids = re.findall(r'class="post-link" href="/news/detail/(\d+)\.html"', page)
+                  newest = max(zip(times, mids), default=("NA", "NA"))
+                  print(f"RESULT {url} | {len(page)}B {cost:.1f}s x-cache={cache} | 条数={len(times)} 最新={newest[0]} mid={newest[1]}")
+              except Exception as e:
+                  print(f"RESULT {url} | 失败 {e}")
+          PYEOF
+          echo "探测结束"
