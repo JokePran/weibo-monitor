@@ -1,8 +1,8 @@
 {
-  "last_mid": "5369498070680329",
+  "last_mid": "5369499268155086",
   "initialized_at": "2026-11-20T10:11:05.048501+08:00",
-  "last_check": "2026-11-26T13:40:44.934872+08:00",
-  "total_pushed": 21,
+  "last_check": "2026-11-26T13:44:55.245194+08:00",
+  "total_pushed": 23,
   "quota_blocked": "2026-11-24",
   "quota_blocked_reason": "pushplus 返回 900，当日请求次数已用尽",
   "quota_blocked_at": "2026-11-24T14:51:23.571056+08:00"
